@@ -1,0 +1,5 @@
+# Keep Linux line endings on scripts so they run inside the Docker container
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf

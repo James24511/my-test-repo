@@ -1,0 +1,83 @@
+name: GitHub Projects Automation
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  move-issue-to-done:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        # Step 1: Checks out the repository to the runner's environment.
+        uses: actions/checkout@v4
+
+      - name: Check if PR is merged
+        # Step 2: Verifies the pull request was merged (not just closed).
+        if: github.event.pull_request.merged == true
+        # Step 3: Finds every issue this PR closes ("Closes #N"), finds that
+        # issue's card on each GitHub Project, and sets its Status to "Done".
+        # Uses the Projects GraphQL API (the old /projects/columns REST API
+        # was retired by GitHub). Needs a PROJECT_TOKEN secret: a personal
+        # access token with the "repo" and "project" scopes.
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          echo "Pull Request merged, moving associated issue to DONE."
+
+          gh api graphql -f query='
+            query($owner: String!, $repo: String!, $pr: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                  closingIssuesReferences(first: 20) {
+                    nodes {
+                      number
+                      projectItems(first: 20) {
+                        nodes {
+                          id
+                          project {
+                            id
+                            title
+                            field(name: "Status") {
+                              ... on ProjectV2SingleSelectField { id options { id name } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f owner="$OWNER" -f repo="$REPO" -F pr="$PR_NUMBER" > result.json
+
+          # One line per card: issue item project field done-option
+          jq -r '.data.repository.pullRequest.closingIssuesReferences.nodes[]
+                 | .number as $n
+                 | .projectItems.nodes[]
+                 | select(.project.field != null)
+                 | [ $n, .id, .project.id, .project.field.id,
+                     ((.project.field.options[] | select(.name == "Done") | .id) // "") ]
+                 | @tsv' result.json > cards.tsv
+
+          if [ ! -s cards.tsv ]; then
+            echo "No linked issues on a project board. Add 'Closes #N' to the PR description."
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r issue item project field done; do
+            if [ -z "$done" ]; then
+              echo "Issue #$issue: project has no 'Done' status option, skipping."
+              continue
+            fi
+            gh api graphql -f query='
+              mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project, itemId: $item, fieldId: $field,
+                  value: { singleSelectOptionId: $option }
+                }) { projectV2Item { id } }
+              }' -f project="$project" -f item="$item" -f field="$field" -f option="$done" > /dev/null
+            echo "Issue #$issue moved to Done."
+          done < cards.tsv
